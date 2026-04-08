@@ -1,176 +1,152 @@
 ﻿from __future__ import annotations
 
-import argparse
-import os
-from pathlib import Path
-
 import pandas as pd
+from typing import Optional, Tuple
 
-from config.pipeline_runner import print_done, print_stage
-from src.ml.dataset.modules.business_metrics import add_business_metrics, reorder_dataset_columns
-from src.ml.dataset.modules.display import print_build_summary, print_rich_table_preview, print_step_status
-from src.ml.dataset.modules.enrichments import join_events, join_meteo
-from src.ml.dataset.modules.feature_engineering import add_temporal_features
-from src.ml.dataset.modules.io import ensure_cols, read_partitioned_parquet_dir, safe_date_for_filename
-from src.ml.dataset.modules.zone_lookup import add_borough_to_tlc, load_zone_lookup
+FINAL_RESTAURANT_COLUMNS = [
+    "camis",
+    "dba",
+    "boro",
+    "building",
+    "street",
+    "zipcode",
+    "phone",
+    "cuisine_description",
+    "inspection_date",
+    "action",
+    "violation_code",
+    "violation_description",
+    "critical_flag",
+    "score",
+    "grade",
+    "grade_date",
+    "record_date",
+    "inspection_type",
+    "latitude",
+    "longitude",
+    "community_board",
+    "council_district",
+    "census_tract",
+    "bin",
+    "bbl",
+    "nta",
+]
 
-MIN_ALLOWED_DATE = pd.Timestamp("2023-01-01").date()
-MAX_ALLOWED_DATE = pd.Timestamp("2025-12-31").date()
-
-# Para generar dataset completo
-# uv run -m src.ml.dataset.a_build_dataset
-# Genera: data/ml/dataset_completo.parquet
-#
-# Para generar un dataset más pequeño para entrenar los modelos más rápidamente (rango por fechas)
-# uv run -m src.ml.dataset.a_build_dataset --from 2024-01-01 --to 2024-01-14
-# Genera: data/ml/dataset_rango_2024-01-01__2024-01-14.parquet
-#
-# Para generar un dataset más pequeño para entrenar los modelos más rápidamente (muestreo aleatorio)
-# uv run -m src.ml.dataset.a_build_dataset --sample-frac 0.01
-# Genera: data/ml/dataset_completo.parquet pero con 1% de filas (si no pasas --from/--to)
-
-
-def build_dataset(
-    tlc_dir: str = "data/aggregated/df_zone_hour_day_service",
-    meteo_path: str = "data/external/meteo/aggregated/df_hour_day/data.parquet",
-    events_dir: str = "data/aggregated/events/df_borough_hour_day",
-    variability_dir: str = "data/aggregated/df_variability",
-    zone_lookup_path: str = "data/external/taxi_zone_lookup.csv",
-    out_path: str = "data/ml/dataset_completo.parquet",
-    date_from: str | None = None,
-    date_to: str | None = None,
-    sample_frac: float | None = None,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    """
-    Genera dataset final de modelado:
-    - Base: capa 3 TLC (zona-hora-fecha-servicio)
-    - Enriquecimiento: borough, meteo, eventos
-    - Features temporales
-    - Métricas de negocio y target operativo
-    """
-    print_stage("ML DATASET BUILD", "Construyendo dataset final", color="yellow")
-    project_root = Path(__file__).resolve().parents[3]
-
-    # --- 1) TLC base
-    tlc_base = project_root / tlc_dir
-    tlc = read_partitioned_parquet_dir(tlc_base)
-
-    ensure_cols(
-        tlc,
-        ["pu_location_id", "hour", "date", "service_type", "num_trips", "avg_price", "std_price"],
-        "TLC",
-    )
-
-    tlc["date"] = pd.to_datetime(tlc["date"], errors="coerce").dt.date
-    tlc["hour"] = pd.to_numeric(tlc["hour"], errors="coerce").astype("Int64")
-    tlc["pu_location_id"] = pd.to_numeric(tlc["pu_location_id"], errors="coerce").astype("Int64")
-    tlc["num_trips"] = pd.to_numeric(tlc["num_trips"], errors="coerce")
-    tlc["avg_price"] = pd.to_numeric(tlc["avg_price"], errors="coerce")
-    tlc["std_price"] = pd.to_numeric(tlc["std_price"], errors="coerce")
-    tlc["service_type"] = tlc["service_type"].astype(str)
-
-    tlc = tlc.dropna(subset=["date", "hour", "pu_location_id", "service_type", "num_trips", "std_price"])
-    tlc = tlc[(tlc["date"] >= MIN_ALLOWED_DATE) & (tlc["date"] <= MAX_ALLOWED_DATE)]
-
-    if date_from is not None:
-        tlc = tlc[tlc["date"] >= pd.to_datetime(date_from).date()]
-    if date_to is not None:
-        tlc = tlc[tlc["date"] <= pd.to_datetime(date_to).date()]
-
-    if sample_frac is not None and 0 < sample_frac < 1:
-        tlc = tlc.sample(frac=sample_frac, random_state=random_state)
-        print_step_status("Muestreo", f"frac={sample_frac}")
-
-    print_step_status("TLC base", f"{len(tlc):,} filas | {len(tlc.columns)} columnas")
-
-    # --- 2) Borough
-    zones = load_zone_lookup(project_root, zone_lookup_path)
-    tlc = add_borough_to_tlc(tlc, zones)
-
-    # --- 3) Meteo
-    df = join_meteo(tlc, project_root, meteo_path)
-
-    # --- 4) Eventos
-    df = join_events(df, project_root, events_dir)
-
-    # --- 5) Features temporales
-    df = add_temporal_features(df)
-
-    # --- 6) Métricas de negocio
-    df = add_business_metrics(df, project_root, variability_dir)
-
-    # --- 7) Orden final
-    df = reorder_dataset_columns(df)
-
-    print_rich_table_preview(
-        df,
-        "Preview dataset final",
-        cols=[
-            "pu_location_id",
-            "borough",
-            "hour",
-            "date",
-            "service_type",
-            "num_trips",
-            "avg_price",
-            "price_variability_rel",
-            "event_count_city",
-            "event_count_borough",
-            "stress_score",
-            "is_stress",
-        ],
-        n=10,
-        max_col_width=16,
-    )
-
-    # --- 8) Guardado
-    out_fp = (project_root / out_path).resolve()
-    os.makedirs(out_fp.parent, exist_ok=True)
-    df.to_parquet(out_fp, index=False)
-
-    print_build_summary(df, out_fp)
-    print_done("DATASET GUARDADO CORRECTAMENTE")
-    return df
+KNOWN_BOROUGHS = {"Bronx", "Brooklyn", "Manhattan", "Queens", "Staten Island"}
+BOROUGH_MAP = {
+    "MANHATTAN": "Manhattan",
+    "BRONX": "Bronx",
+    "BROOKLYN": "Brooklyn",
+    "QUEENS": "Queens",
+    "STATEN ISLAND": "Staten Island",
+    "1": "Manhattan",
+    "2": "Bronx",
+    "3": "Brooklyn",
+    "4": "Queens",
+    "5": "Staten Island",
+}
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Construye dataset de modelado (TLC + Meteo + Eventos). "
-        "Por defecto genera el dataset completo."
-    )
-    p.add_argument(
-        "--from",
-        dest="date_from",
-        default=None,
-        help="YYYY-MM-DD (inclusive). Si se indica junto con --to, genera dataset por rango.",
-    )
-    p.add_argument(
-        "--to",
-        dest="date_to",
-        default=None,
-        help="YYYY-MM-DD (inclusive). Si se indica junto con --from, genera dataset por rango.",
-    )
-    p.add_argument("--sample-frac", type=float, default=None, help="Opcional: muestreo aleatorio (0<frac<1).")
-    p.add_argument("--out-dir", default="data/ml", help="Carpeta de salida (default: data/ml).")
-    args = p.parse_args()
+def _pick_first_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    for col in candidates:
+        if col in df.columns:
+            return df[col]
+    return pd.Series(pd.NA, index=df.index)
 
-    out_dir = Path(args.out_dir)
 
-    if args.date_from and args.date_to:
-        f = safe_date_for_filename(args.date_from)
-        t = safe_date_for_filename(args.date_to)
-        out_name = f"dataset_rango_{f}__{t}.parquet"
-    else:
-        out_name = "dataset_completo.parquet"
-
-    build_dataset(
-        out_path=str(out_dir / out_name),
-        date_from=args.date_from,
-        date_to=args.date_to,
-        sample_frac=args.sample_frac,
+def _clean_text_series(series: pd.Series) -> pd.Series:
+    return (
+        series.astype("string")
+        .str.strip()
+        .replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA, "None": pd.NA})
     )
 
 
-if __name__ == "__main__":
-    main()
+def _coerce_numeric(series: pd.Series) -> pd.Series:
+    cleaned = (
+        series.astype("string")
+        .str.replace(r"[^0-9,\.\-]", "", regex=True)
+        .str.replace(",", ".", regex=False)
+        .replace({"": pd.NA, "nan": pd.NA, "<NA>": pd.NA, "None": pd.NA})
+    )
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def _normalize_borough(series: pd.Series) -> pd.Series:
+    clean = _clean_text_series(series)
+    upper = clean.str.upper()
+    mapped = upper.map(BOROUGH_MAP)
+    return mapped.fillna(clean.str.title())
+
+
+def _estandarizar_columnas(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    out["camis"] = _pick_first_series(df, ["camis", "CAMIS"])
+    out["dba"] = _pick_first_series(df, ["dba", "DBA"])
+    out["boro"] = _pick_first_series(df, ["boro", "borough", "Boro"])
+    out["building"] = _pick_first_series(df, ["building"])
+    out["street"] = _pick_first_series(df, ["street"])
+    out["zipcode"] = _pick_first_series(df, ["zipcode", "zip"])
+    out["phone"] = _pick_first_series(df, ["phone"])
+    out["cuisine_description"] = _pick_first_series(df, ["cuisine_description"])
+    out["inspection_date"] = _pick_first_series(df, ["inspection_date"])
+    out["action"] = _pick_first_series(df, ["action"])
+    out["violation_code"] = _pick_first_series(df, ["violation_code"])
+    out["violation_description"] = _pick_first_series(df, ["violation_description"])
+    out["critical_flag"] = _pick_first_series(df, ["critical_flag"])
+    out["score"] = _pick_first_series(df, ["score"])
+    out["grade"] = _pick_first_series(df, ["grade"])
+    out["grade_date"] = _pick_first_series(df, ["grade_date"])
+    out["record_date"] = _pick_first_series(df, ["record_date"])
+    out["inspection_type"] = _pick_first_series(df, ["inspection_type"])
+    out["latitude"] = _pick_first_series(df, ["latitude"])
+    out["longitude"] = _pick_first_series(df, ["longitude"])
+    out["community_board"] = _pick_first_series(df, ["community_board"])
+    out["council_district"] = _pick_first_series(df, ["council_district"])
+    out["census_tract"] = _pick_first_series(df, ["census_tract"])
+    out["bin"] = _pick_first_series(df, ["bin"])
+    out["bbl"] = _pick_first_series(df, ["bbl"])
+    out["nta"] = _pick_first_series(df, ["nta"])
+    return out[FINAL_RESTAURANT_COLUMNS]
+
+
+def clean_restaurants_batch(df: pd.DataFrame, date_file: Optional[Tuple[int, int]] = None) -> pd.DataFrame:
+    del date_file
+
+    df = _estandarizar_columnas(df)
+
+    df["camis"] = pd.to_numeric(df["camis"], errors="coerce").astype("Int64")
+    df["score"] = pd.to_numeric(df["score"], errors="coerce").astype("Int64")
+    df["latitude"] = _coerce_numeric(df["latitude"])
+    df["longitude"] = _coerce_numeric(df["longitude"])
+
+    for col in ["inspection_date", "grade_date", "record_date"]:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    for col in [
+        "dba", "building", "street", "zipcode", "phone", "cuisine_description",
+        "action", "violation_code", "violation_description", "critical_flag",
+        "grade", "inspection_type", "community_board", "council_district",
+        "census_tract", "bin", "bbl", "nta",
+    ]:
+        df[col] = _clean_text_series(df[col])
+
+    df["boro"] = _normalize_borough(df["boro"])
+    df["dba"] = df["dba"].str.title()
+    df["street"] = df["street"].str.title()
+    df["cuisine_description"] = df["cuisine_description"].str.title()
+    df["critical_flag"] = df["critical_flag"].str.title()
+    df["grade"] = df["grade"].str.upper()
+    df["inspection_type"] = df["inspection_type"].str.title()
+
+    mask_camis = df["camis"].notna()
+    mask_date = df["inspection_date"].notna()
+    mask_boro = df["boro"].isin(KNOWN_BOROUGHS)
+    mask_lat = df["latitude"].isna() | ((df["latitude"] >= 40.4) & (df["latitude"] <= 41.0))
+    mask_lon = df["longitude"].isna() | ((df["longitude"] >= -74.3) & (df["longitude"] <= -73.6))
+    mask_score = df["score"].isna() | ((df["score"] >= 0) & (df["score"] <= 100))
+
+    df_clean = df[mask_camis & mask_date & mask_boro & mask_lat & mask_lon & mask_score].copy()
+    df_clean = df_clean.drop_duplicates()
+
+    return df_clean[FINAL_RESTAURANT_COLUMNS]
