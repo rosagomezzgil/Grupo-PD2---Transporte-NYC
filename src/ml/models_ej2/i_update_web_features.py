@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 
 import requests
 
@@ -10,7 +11,7 @@ from src.ml.models_ej2.h_build_web_features import build_web_features
 DEFAULT_DATASET_DIR = "data/aggregated/ex_stress/df_stress_zone_hour_day"
 DEFAULT_WEB_MODEL_DIR = "outputs/ejercicio2/web_model"
 DEFAULT_BACKEND_URL = "http://127.0.0.1:8000/api"
-DEFAULT_ADMIN_TOKEN = "***REMOVED***"
+DEFAULT_ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
 
 def reload_backend_model(backend_url: str, admin_token: str) -> None:
